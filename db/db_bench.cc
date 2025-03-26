@@ -241,7 +241,7 @@ class ReporterAgent {
                 // round the seconds elapsed
                 auto secs_elapsed =
                         (Env::Default()->NowMicros() - time_started + 1000*1000 / 2) /
-                        1000*1000;
+                                (1000*1000);
                 std::string report =
                         std::to_string(secs_elapsed) + "," +
                         std::to_string(total_ops_done_snapshot - last_report_) + "\n";
