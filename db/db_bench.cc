@@ -22,7 +22,10 @@
 #include <streambuf>
 #include <string>
 #include <istream>
-
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
 // Comma-separated list of operations to run in the specified order
 //   Actual benchmarks:
 //      fillseq       -- write N values in sequential key order in async mode
@@ -71,6 +74,9 @@ static int FLAGS_num = 100000;
 
 // Number of read operations to do.  If negative, do FLAGS_num reads.
 static int FLAGS_reads = -1;
+
+static int FLAGS_report_interval_seconds = 0;
+
 
 // Number of concurrent threads to run.
 static int FLAGS_threads = 1;
@@ -176,6 +182,96 @@ static void AppendWithSpace(std::string* str, Slice msg) {
     str->append(msg.data(), msg.size());
 }
 
+class ReporterAgent {
+        public:
+            ReporterAgent(Env* env, const std::string& fname,
+                          uint64_t report_interval_secs)
+                    : env_(env),
+                      total_ops_done_(0),
+                      last_report_(0),
+                      report_interval_secs_(report_interval_secs),
+                      stop_(false) {
+              auto s = env_->NewWritableFile(fname, &report_file_);
+              if (s.ok()) {
+                s = report_file_->Append(Header() + "\n");
+              }
+              if (s.ok()) {
+                s = report_file_->Flush();
+              }
+              if (!s.ok()) {
+                fprintf(stderr, "Can't open %s: %s\n", fname.c_str(),
+                        s.ToString().c_str());
+                abort();
+              }
+
+              reporting_thread_ = std::thread([&]() { SleepAndReport(); });
+            }
+
+            ~ReporterAgent() {
+              {
+                std::unique_lock<std::mutex> lk(mutex_);
+                stop_ = true;
+                stop_cv_.notify_all();
+              }
+              reporting_thread_.join();
+              report_file_->Close();
+            }
+
+            // thread safe
+            void ReportFinishedOps(int64_t num_ops) {
+              total_ops_done_.fetch_add(num_ops);
+            }
+
+        private:
+            std::string Header() const { return "secs_elapsed,interval_qps"; }
+            void SleepAndReport() {
+              auto time_started = Env::Default()->NowMicros();
+              while (true) {
+                {
+                  std::unique_lock<std::mutex> lk(mutex_);
+                  if (stop_ ||
+                      stop_cv_.wait_for(lk, std::chrono::seconds(report_interval_secs_),
+                                        [&]() { return stop_; })) {
+                    // stopping
+                    break;
+                  }
+                  // else -> timeout, which means time for a report!
+                }
+                auto total_ops_done_snapshot = total_ops_done_.load();
+                // round the seconds elapsed
+                auto secs_elapsed =
+                        (Env::Default()->NowMicros() - time_started + 1000*1000 / 2) /
+                        1000*1000;
+                std::string report =
+                        std::to_string(secs_elapsed) + "," +
+                        std::to_string(total_ops_done_snapshot - last_report_) + "\n";
+                auto s = report_file_->Append(report);
+                if (s.ok()) {
+                  s = report_file_->Flush();
+                }
+                if (!s.ok()) {
+                  fprintf(stderr,
+                          "Can't write to report file (%s), stopping the reporting\n",
+                          s.ToString().c_str());
+                  break;
+                }
+                last_report_ = total_ops_done_snapshot;
+              }
+            }
+
+            Env* env_;
+            WritableFile* report_file_;
+            std::atomic<int64_t> total_ops_done_;
+            int64_t last_report_;
+            const uint64_t report_interval_secs_;
+            std::thread reporting_thread_;
+            std::mutex mutex_;
+            // will notify on stop
+            std::condition_variable stop_cv_;
+            bool stop_;
+};
+
+
 class Stats {
 private:
     double start_;
@@ -187,10 +283,13 @@ private:
     double last_op_finish_;
     Histogram hist_;
     std::string message_;
+    ReporterAgent* reporter_agent_;
 
 public:
     Stats() { Start(); }
-
+    void SetReporterAgent(ReporterAgent* reporter_agent) {
+      reporter_agent_ = reporter_agent;
+    }
     void Start() {
         next_report_ = 100;
         last_op_finish_ = start_;
@@ -225,6 +324,9 @@ public:
     }
 
     void FinishedSingleOp() {
+      if (reporter_agent_) {
+        reporter_agent_->ReportFinishedOps(1);
+      }
         if (FLAGS_histogram) {
             double now = Env::Default()->NowMicros();
             double micros = now - last_op_finish_;
@@ -459,6 +561,8 @@ public:
             entries_per_batch_ = 1;
             write_options_ = WriteOptions();
 
+
+
             void (Benchmark::*method)(ThreadState*) = NULL;
             bool fresh_db = false;
             int num_threads = FLAGS_threads;
@@ -597,6 +701,13 @@ private:
         shared.num_done = 0;
         shared.start = false;
 
+      std::unique_ptr<ReporterAgent> reporter_agent;
+      if (FLAGS_report_interval_seconds > 0) {
+        reporter_agent.reset(new ReporterAgent(Env::Default(), "report.csv",
+                                               FLAGS_report_interval_seconds));
+      }
+
+
         ThreadArg* arg = new ThreadArg[n];
         for (int i = 0; i < n; i++) {
             arg[i].bm = this;
@@ -604,6 +715,7 @@ private:
             arg[i].shared = &shared;
             arg[i].thread = new ThreadState(i);
             arg[i].thread->shared = &shared;
+            arg[i].thread->stats.SetReporterAgent(reporter_agent.get());
             flush_caches();
             Env::Default()->StartThread(ThreadBody, &arg[i]);
         }
@@ -1049,6 +1161,8 @@ int main(int argc, char** argv) {
             FLAGS_num = n;
         } else if (sscanf(argv[i], "--reads=%d%c", &n, &junk) == 1) {
             FLAGS_reads = n;
+        } else if (sscanf(argv[i], "--report_interval_seconds=%d%c", &n, &junk) == 1) {
+          FLAGS_report_interval_seconds = n;
         } else if (sscanf(argv[i], "--threads=%d%c", &n, &junk) == 1) {
             FLAGS_threads = n;
         } else if (sscanf(argv[i], "--value_size=%d%c", &n, &junk) == 1) {
